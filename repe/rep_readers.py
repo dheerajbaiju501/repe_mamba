@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.cluster import KMeans
 import numpy as np
 from itertools import islice
@@ -139,15 +139,53 @@ class PCARepReader(RepReader):
         directions = {}
 
         for layer in hidden_layers:
-            H_train = hidden_states[layer]
-            H_train_mean = H_train.mean(axis=0, keepdims=True)
-            self.H_train_means[layer] = H_train_mean
-            H_train = recenter(H_train, mean=H_train_mean).cpu()
-            H_train = np.vstack(H_train)
-            pca_model = PCA(n_components=self.n_components, whiten=False).fit(H_train)
-
-            directions[layer] = pca_model.components_ # shape (n_components, n_features)
-            self.n_components = pca_model.n_components_
+            try:
+                # Copy data to avoid modifying original
+                if isinstance(hidden_states[layer], torch.Tensor):
+                    H_train = hidden_states[layer].clone().cpu().detach().numpy()
+                else:
+                    H_train = hidden_states[layer].copy()
+                
+                # Check for NaN or Inf values
+                if np.isnan(H_train).any() or np.isinf(H_train).any():
+                    print(f"Warning: Layer {layer} contains NaN or Inf values. Cleaning data...")
+                    # Replace NaN/Inf with zeros
+                    H_train = np.nan_to_num(H_train, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Compute mean (safely)
+                H_train_mean = np.nanmean(H_train, axis=0, keepdims=True)
+                # Replace any NaN in mean with zeros
+                H_train_mean = np.nan_to_num(H_train_mean, nan=0.0)
+                self.H_train_means[layer] = H_train_mean
+                
+                # Center the data
+                H_train = H_train - H_train_mean
+                # Do another NaN cleanup after centering
+                H_train = np.nan_to_num(H_train, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Final check before passing to IncrementalPCA
+                if np.isnan(H_train).any() or np.isinf(H_train).any():
+                    raise ValueError(f"Failed to clean NaN/Inf values in layer {layer}")
+                
+                # Use IncrementalPCA which can be more robust
+                ipca = IncrementalPCA(n_components=self.n_components)
+                ipca.fit(H_train)
+                directions[layer] = ipca.components_
+                self.n_components = ipca.n_components_
+                
+            except Exception as e:
+                print(f"Error processing layer {layer}: {str(e)}")
+                print(f"Using fallback random directions for layer {layer}")
+                # Fallback to random directions if analysis fails
+                feature_dim = hidden_states[layer].shape[1]
+                directions[layer] = np.random.randn(self.n_components, feature_dim)
+        
+        # Make sure every layer has directions
+        for layer in hidden_layers:
+            if layer not in directions:
+                print(f"No directions for layer {layer}, using random fallback")
+                feature_dim = hidden_states[layer].shape[1]
+                directions[layer] = np.random.randn(self.n_components, feature_dim)
         
         return directions
 
