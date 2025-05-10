@@ -1,14 +1,35 @@
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict, Any, Type
 from transformers import Pipeline
 import torch
 import numpy as np
+import logging
 from .rep_readers import DIRECTION_FINDERS, RepReader
+
+logger = logging.getLogger(__name__)
 
 class RepReadingPipeline(Pipeline):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        logger.info("Initializing Mamba representation reading pipeline")
+        # Fix Conv1d padding issue in Mamba2Block as mentioned in the memory
+        self._fix_mamba_conv_padding()
 
+    def _fix_mamba_conv_padding(self):
+        """Fix the Conv1d padding issue in Mamba2Block"""
+        modified_count = 0
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Conv1d):
+                # Check if this is the Conv1d in a Mamba block with kernel_size-1 padding
+                if hasattr(module, 'padding') and isinstance(module.padding, tuple) and \
+                   len(module.padding) == 1 and module.padding[0] == module.kernel_size[0] - 1:
+                    # Change padding from kernel_size-1 to 'same'
+                    module.padding = 'same'
+                    modified_count += 1
+        
+        if modified_count > 0:
+            logger.info(f"Fixed Conv1d padding in {modified_count} Mamba layers")
+    
     def _get_hidden_states(
             self, 
             outputs,
@@ -16,16 +37,55 @@ class RepReadingPipeline(Pipeline):
             hidden_layers: Union[List[int], int]=-1,
             which_hidden_states: Optional[str]=None):
         
-        if hasattr(outputs, 'encoder_hidden_states') and hasattr(outputs, 'decoder_hidden_states'):
-            outputs['hidden_states'] = outputs[f'{which_hidden_states}_hidden_states']
-    
         hidden_states_layers = {}
-        for layer in hidden_layers:
-            hidden_states = outputs['hidden_states'][layer]
-            hidden_states =  hidden_states[:, rep_token, :].detach()
-            if hidden_states.dtype == torch.bfloat16:
-                hidden_states = hidden_states.float()
-            hidden_states_layers[layer] = hidden_states.detach()
+        
+        # Check for Mamba-specific SSM states
+        if hasattr(outputs, 'ssm_states') and outputs.ssm_states is not None:
+            # Using SSM states directly
+            for layer in hidden_layers:
+                layer_idx = layer if layer >= 0 else len(outputs.ssm_states) + layer
+                if 0 <= layer_idx < len(outputs.ssm_states):
+                    hidden_states = outputs.ssm_states[layer_idx]
+                    # For rep_token=-1, get the last token's state
+                    token_idx = rep_token if rep_token >= 0 else hidden_states.size(1) + rep_token
+                    hidden_states = hidden_states[:, token_idx, :].detach()
+                    if hidden_states.dtype == torch.bfloat16:
+                        hidden_states = hidden_states.float()
+                    hidden_states_layers[layer] = hidden_states.detach()
+            return hidden_states_layers
+            
+        # Fallback to standard hidden_states if SSM states not available
+        if 'hidden_states' in outputs:
+            for layer in hidden_layers:
+                layer_idx = layer if layer >= 0 else len(outputs['hidden_states']) + layer
+                if 0 <= layer_idx < len(outputs['hidden_states']):
+                    hidden_states = outputs['hidden_states'][layer_idx]
+                    token_idx = rep_token if rep_token >= 0 else hidden_states.size(1) + rep_token
+                    hidden_states = hidden_states[:, token_idx, :].detach()
+                    if hidden_states.dtype == torch.bfloat16:
+                        hidden_states = hidden_states.float()
+                    hidden_states_layers[layer] = hidden_states.detach()
+        
+        # If nothing worked, try to find hidden states in other common attributes
+        if not hidden_states_layers:
+            possible_attrs = ['last_hidden_state', 'all_hidden_states']
+            for attr_name in possible_attrs:
+                if hasattr(outputs, attr_name):
+                    hidden_states_source = getattr(outputs, attr_name)
+                    if isinstance(hidden_states_source, (list, tuple)):
+                        for layer in hidden_layers:
+                            layer_idx = layer if layer >= 0 else len(hidden_states_source) + layer
+                            if 0 <= layer_idx < len(hidden_states_source):
+                                hidden_states = hidden_states_source[layer_idx]
+                                token_idx = rep_token if rep_token >= 0 else hidden_states.size(1) + rep_token
+                                hidden_states = hidden_states[:, token_idx, :].detach()
+                                if hidden_states.dtype == torch.bfloat16:
+                                    hidden_states = hidden_states.float()
+                                hidden_states_layers[layer] = hidden_states.detach()
+                    break
+                    
+        if not hidden_states_layers:
+            logger.warning("Could not find hidden states in Mamba model output. Check model output format.")
 
         return hidden_states_layers
 
@@ -67,18 +127,23 @@ class RepReadingPipeline(Pipeline):
         return outputs
 
     def _forward(self, model_inputs, rep_token, hidden_layers, rep_reader=None, component_index=0, which_hidden_states=None, pad_token_id=None):
-        """
-        Args:
-        - which_hidden_states (str): Specifies which part of the model (encoder, decoder, or both) to compute the hidden states from. 
-                        It's applicable only for encoder-decoder models. Valid values: 'encoder', 'decoder'.
-        """
-        # get model hidden states and optionally transform them with a RepReader
+        """Forward pass for Mamba model"""
+        # Run the model and get hidden states
         with torch.no_grad():
-            if hasattr(self.model, "encoder") and hasattr(self.model, "decoder"):
-                decoder_start_token = [self.tokenizer.pad_token] * model_inputs['input_ids'].size(0)
-                decoder_input = self.tokenizer(decoder_start_token, return_tensors="pt").input_ids
-                model_inputs['decoder_input_ids'] = decoder_input
-            outputs =  self.model(**model_inputs, output_hidden_states=True)
+            # Ensure the proper config for Mamba models
+            forward_kwargs = {
+                'output_hidden_states': True,
+                'return_dict': True
+            }
+            
+            # Move inputs to the same device as the model
+            if hasattr(self.model, 'device') and hasattr(model_inputs, 'to'):
+                model_inputs = {k: v.to(self.model.device) if hasattr(v, 'to') else v 
+                               for k, v in model_inputs.items()}
+            
+            # Get model outputs
+            outputs = self.model(**model_inputs, **forward_kwargs)
+                
         hidden_states = self._get_hidden_states(outputs, rep_token, hidden_layers, which_hidden_states)
         
         if rep_reader is None:

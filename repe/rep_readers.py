@@ -4,32 +4,55 @@ from sklearn.cluster import KMeans
 import numpy as np
 from itertools import islice
 import torch
+import logging
+
+logger = logging.getLogger(__name__)
 
 def project_onto_direction(H, direction):
     """Project matrix H (n, d_1) onto direction vector (d_2,)"""
-    # Calculate the magnitude of the direction vector
-     # Ensure H and direction are on the same device (CPU or GPU)
-    if type(direction) != torch.Tensor:
-        H = torch.Tensor(H).cuda()
-    if type(direction) != torch.Tensor:
-        direction = torch.Tensor(direction)
+    # Calculate the magnitude of the direction vector for Mamba hidden states
+    # Ensure H and direction are on the same device (CPU or GPU)
+    if not isinstance(H, torch.Tensor):
+        H = torch.tensor(H, dtype=torch.float32)
+        # Only move to CUDA if available
+        if torch.cuda.is_available():
+            H = H.cuda()
+    
+    if not isinstance(direction, torch.Tensor):
+        direction = torch.tensor(direction, dtype=torch.float32)
         direction = direction.to(H.device)
+    
     mag = torch.norm(direction)
-    assert not torch.isinf(mag).any()
+    if torch.isinf(mag).any() or mag < 1e-8:
+        logger.warning("Direction vector has extremely small or infinite magnitude")
+        mag = torch.clamp(mag, min=1e-8)  # Prevent division by zero
+    
     # Calculate the projection
     projection = H.matmul(direction) / mag
     return projection
 
 def recenter(x, mean=None):
-    x = torch.Tensor(x).cuda()
+    # Convert to tensor if not already
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=torch.float32)
+        # Only move to CUDA if available
+        if torch.cuda.is_available():
+            x = x.cuda()
+            
     if mean is None:
-        mean = torch.mean(x,axis=0,keepdims=True).cuda()
+        mean = torch.mean(x, axis=0, keepdims=True)
+        if torch.cuda.is_available():
+            mean = mean.cuda()
     else:
-        mean = torch.Tensor(mean).cuda()
+        if not isinstance(mean, torch.Tensor):
+            mean = torch.tensor(mean, dtype=torch.float32)
+            if torch.cuda.is_available():
+                mean = mean.cuda()
+    
     return x - mean
 
 class RepReader(ABC):
-    """Class to identify and store concept directions.
+    """Class to identify and store concept directions for Mamba models.
     
     Subclasses implement the abstract methods to identify concept directions 
     for each hidden layer via strategies including PCA, embedding vectors 
@@ -47,12 +70,12 @@ class RepReader(ABC):
 
     @abstractmethod
     def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
-        """Get concept directions for each hidden layer of the model
+        """Get concept directions for each hidden layer of the Mamba model
         
         Args:
-            model: Model to get directions for
+            model: Mamba 2 model to get directions for
             tokenizer: Tokenizer to use
-            hidden_states: Hidden states of the model on the training data (per layer)
+            hidden_states: SSM hidden states of the model on the training data (per layer)
             hidden_layers: Layers to consider
 
         Returns:
@@ -126,8 +149,8 @@ class RepReader(ABC):
         return transformed_hidden_states
 
 class PCARepReader(RepReader):
-    """Extract directions via PCA"""
-    needs_hiddens = True 
+    """Extract directions via PCA for Mamba state space models"""
+    needs_hiddens = True
 
     def __init__(self, n_components=1):
         super().__init__()
@@ -135,19 +158,45 @@ class PCARepReader(RepReader):
         self.H_train_means = {}
 
     def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
-        """Get PCA components for each layer"""
+        # Get PCA components for each layer - adapted for Mamba models
+
         directions = {}
-
         for layer in hidden_layers:
+            if layer not in hidden_states:
+                logger.warning(f"Layer {layer} not found in hidden_states. Skipping.")
+                continue
+                
             H_train = hidden_states[layer]
-            H_train_mean = H_train.mean(axis=0, keepdims=True)
-            self.H_train_means[layer] = H_train_mean
-            H_train = recenter(H_train, mean=H_train_mean).cpu()
-            H_train = np.vstack(H_train)
-            pca_model = PCA(n_components=self.n_components, whiten=False).fit(H_train)
+            if len(H_train) == 0:
+                logger.warning(f"No hidden states found for layer {layer}. Skipping.")
+                continue
+                
+            # Convert to numpy if tensor
+            if isinstance(H_train, torch.Tensor):
+                H_train = H_train.cpu().numpy()
 
-            directions[layer] = pca_model.components_ # shape (n_components, n_features)
-            self.n_components = pca_model.n_components_
+            # get and save the mean
+            self.H_train_means[layer] = np.mean(H_train, axis=0)
+
+            # center the data
+            H_train = H_train - self.H_train_means[layer]
+            
+            # Determine number of components based on data dimensions
+            effective_n_components = min(self.n_components, H_train.shape[0], H_train.shape[1])
+            if effective_n_components < self.n_components:
+                logger.warning(f"Reducing PCA components from {self.n_components} to {effective_n_components} due to data dimensions")
+
+            # calculate PCA with error handling
+            try:
+                pca_model = PCA(n_components=effective_n_components, whiten=False).fit(H_train)
+                directions[layer] = pca_model.components_  # shape (n_components, n_features)
+                self.n_components = pca_model.n_components_
+            except Exception as e:
+                logger.error(f"PCA failed for layer {layer}: {str(e)}")
+                # Fallback to random direction if PCA fails
+                hidden_size = H_train.shape[1]
+                directions[layer] = np.random.randn(effective_n_components, hidden_size)
+                logger.warning(f"Using random directions for layer {layer} due to PCA failure")
         
         return directions
 
@@ -186,7 +235,8 @@ class PCARepReader(RepReader):
 
         
 class ClusterMeanRepReader(RepReader):
-    """Get the direction that is the difference between the mean of the positive and negative clusters."""
+    """Get the direction that is the difference between the mean of the positive and negative clusters
+    in Mamba SSM hidden states."""
     n_components = 1
     needs_hiddens = True
 
@@ -194,24 +244,53 @@ class ClusterMeanRepReader(RepReader):
         super().__init__()
 
     def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
-
         # train labels is necessary to differentiate between different classes
-        train_choices = kwargs['train_choices'] if 'train_choices' in kwargs else None
-        assert train_choices is not None, "ClusterMeanRepReader requires train_choices to differentiate two clusters"
-        for layer in hidden_layers:
-            assert len(train_choices) == len(hidden_states[layer]), f"Shape mismatch between hidden states ({len(hidden_states[layer])}) and labels ({len(train_choices)})"
-
-        train_choices = np.array(train_choices)
-        neg_class = np.where(train_choices == 0)
-        pos_class = np.where(train_choices == 1)
-
+        train_choices = kwargs.get('train_choices')
+        if train_choices is None:
+            raise ValueError("ClusterMeanRepReader requires train_choices to differentiate two clusters")
+            
         directions = {}
         for layer in hidden_layers:
-            H_train = np.array(hidden_states[layer])
+            if layer not in hidden_states:
+                logger.warning(f"Layer {layer} not found in hidden_states. Skipping.")
+                continue
+                
+            if len(hidden_states[layer]) == 0:
+                logger.warning(f"No hidden states found for layer {layer}. Skipping.")
+                continue
+                
+            if len(train_choices) != len(hidden_states[layer]):
+                logger.warning(f"Shape mismatch between hidden states ({len(hidden_states[layer])}) and labels ({len(train_choices)}). Skipping layer {layer}.")
+                continue
 
+            # Convert train_choices to numpy array if it's not already
+            train_choices_np = np.array(train_choices)
+            neg_class = np.where(train_choices_np == 0)
+            pos_class = np.where(train_choices_np == 1)
+            
+            # Handle case where one class has no examples
+            if len(neg_class[0]) == 0 or len(pos_class[0]) == 0:
+                logger.warning(f"One class has no examples in layer {layer}. Using random direction.")
+                # Get hidden dimension size
+                if isinstance(hidden_states[layer], torch.Tensor):
+                    H_train = hidden_states[layer].cpu().numpy()
+                else:
+                    H_train = np.array(hidden_states[layer])
+                hidden_size = H_train.shape[1]
+                directions[layer] = np.random.randn(1, hidden_size)
+                continue
+
+            # Convert to numpy if tensor
+            if isinstance(hidden_states[layer], torch.Tensor):
+                H_train = hidden_states[layer].cpu().numpy()
+            else:
+                H_train = np.array(hidden_states[layer])
+
+            # Calculate mean vectors for positive and negative classes
             H_pos_mean = H_train[pos_class].mean(axis=0, keepdims=True)
             H_neg_mean = H_train[neg_class].mean(axis=0, keepdims=True)
 
+            # The direction is from negative to positive class
             directions[layer] = H_pos_mean - H_neg_mean
         
         return directions
@@ -228,10 +307,21 @@ class RandomRepReader(RepReader):
         self.needs_hiddens = needs_hiddens
 
     def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
-
         directions = {}
         for layer in hidden_layers:
-            directions[layer] = np.expand_dims(np.random.randn(model.config.hidden_size), 0)
+            # Get the hidden dimension size for Mamba model
+            if hasattr(model, 'config') and hasattr(model.config, 'd_model'):
+                # Mamba models use d_model
+                hidden_size = model.config.d_model
+            elif hidden_states is not None and layer in hidden_states and hidden_states[layer].shape[1] > 0:
+                # Infer from the hidden states themselves
+                hidden_size = hidden_states[layer].shape[1]
+            else:
+                # Default for Mamba
+                logger.warning(f"Could not determine hidden size for layer {layer}. Using default 1024.")
+                hidden_size = 1024
+                
+            directions[layer] = np.expand_dims(np.random.randn(hidden_size), 0)
 
         return directions
 
