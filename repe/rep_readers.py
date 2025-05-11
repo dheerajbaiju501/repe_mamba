@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def project_onto_direction(H, direction):
     """Project matrix H (n, d_1) onto direction vector (d_2,)"""
-    # Calculate the magnitude of the direction vector for Mamba hidden states
+    # Calculate the magnitude of the direction vector for model hidden states
     # Ensure H and direction are on the same device (CPU or GPU)
     if not isinstance(H, torch.Tensor):
         H = torch.tensor(H, dtype=torch.float32)
@@ -52,7 +52,7 @@ def recenter(x, mean=None):
     return x - mean
 
 class RepReader(ABC):
-    """Class to identify and store concept directions for Mamba models.
+    """Class to identify and store concept directions for language models.
     
     Subclasses implement the abstract methods to identify concept directions 
     for each hidden layer via strategies including PCA, embedding vectors 
@@ -70,12 +70,12 @@ class RepReader(ABC):
 
     @abstractmethod
     def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
-        """Get concept directions for each hidden layer of the Mamba model
+        """Get concept directions for each hidden layer of the model
         
         Args:
-            model: Mamba 2 model to get directions for
+            model: Language model to get directions for
             tokenizer: Tokenizer to use
-            hidden_states: SSM hidden states of the model on the training data (per layer)
+            hidden_states: Hidden states of the model on the training data (per layer)
             hidden_layers: Layers to consider
 
         Returns:
@@ -149,7 +149,7 @@ class RepReader(ABC):
         return transformed_hidden_states
 
 class PCARepReader(RepReader):
-    """Extract directions via PCA for Mamba state space models"""
+    """Extract directions via PCA for language models"""
     needs_hiddens = True
 
     def __init__(self, n_components=1):
@@ -236,7 +236,7 @@ class PCARepReader(RepReader):
         
 class ClusterMeanRepReader(RepReader):
     """Get the direction that is the difference between the mean of the positive and negative clusters
-    in Mamba SSM hidden states."""
+    in model hidden states."""
     n_components = 1
     needs_hiddens = True
 
@@ -309,15 +309,18 @@ class RandomRepReader(RepReader):
     def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
         directions = {}
         for layer in hidden_layers:
-            # Get the hidden dimension size for Mamba model
+            # Get the hidden dimension size from model config
             if hasattr(model, 'config') and hasattr(model.config, 'd_model'):
-                # Mamba models use d_model
+                # Some models use d_model
                 hidden_size = model.config.d_model
+            elif hasattr(model, 'config') and hasattr(model.config, 'hidden_size'):
+                # Some models use hidden_size
+                hidden_size = model.config.hidden_size
             elif hidden_states is not None and layer in hidden_states and hidden_states[layer].shape[1] > 0:
                 # Infer from the hidden states themselves
                 hidden_size = hidden_states[layer].shape[1]
             else:
-                # Default for Mamba
+                # Default fallback
                 logger.warning(f"Could not determine hidden size for layer {layer}. Using default 1024.")
                 hidden_size = 1024
                 

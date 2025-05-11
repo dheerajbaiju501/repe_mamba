@@ -11,12 +11,12 @@ class RepReadingPipeline(Pipeline):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        logger.info("Initializing Mamba representation reading pipeline")
+        logger.info("Initializing representation reading pipeline")
         # Fix Conv1d padding issue in Mamba2Block as mentioned in the memory
         self._fix_mamba_conv_padding()
 
     def _fix_mamba_conv_padding(self):
-        """Fix the Conv1d padding issue in Mamba2Block"""
+        """Fix the Conv1d padding issue if this is a Mamba model"""
         modified_count = 0
         for name, module in self.model.named_modules():
             if isinstance(module, torch.nn.Conv1d):
@@ -39,7 +39,7 @@ class RepReadingPipeline(Pipeline):
         
         hidden_states_layers = {}
         
-        # Check for Mamba-specific SSM states
+        # Check for SSM states (Mamba models)
         if hasattr(outputs, 'ssm_states') and outputs.ssm_states is not None:
             # Using SSM states directly
             for layer in hidden_layers:
@@ -127,10 +127,10 @@ class RepReadingPipeline(Pipeline):
         return outputs
 
     def _forward(self, model_inputs, rep_token, hidden_layers, rep_reader=None, component_index=0, which_hidden_states=None, pad_token_id=None):
-        """Forward pass for Mamba model"""
+        """Forward pass for model"""
         # Run the model and get hidden states
         with torch.no_grad():
-            # Ensure the proper config for Mamba models
+            # Ensure the proper config for model
             forward_kwargs = {
                 'output_hidden_states': True,
                 'return_dict': True
