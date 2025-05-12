@@ -185,11 +185,16 @@ class RepReadingPipeline(Pipeline):
 
     def _forward(self, model_inputs, rep_token, hidden_layers, rep_reader=None, component_index=0, which_hidden_states=None, pad_token_id=None):
         """Forward pass for model"""
-        # Run the model and get hidden states
         with torch.no_grad():
-            # Use attention mask if available
+            # Check if this is a Mamba model
+            is_mamba = False
+            if hasattr(self.model, 'config'):
+                model_type = getattr(self.model.config, 'model_type', '')
+                is_mamba = model_type == 'mamba' or 'mamba' in model_type.lower()
+            
+            # Set up forward kwargs - Mamba doesn't use attention_mask
             forward_kwargs = {}
-            if 'attention_mask' in model_inputs:
+            if 'attention_mask' in model_inputs and not is_mamba:
                 forward_kwargs['attention_mask'] = model_inputs['attention_mask']
             
             if pad_token_id is not None:
@@ -204,17 +209,18 @@ class RepReadingPipeline(Pipeline):
                 model_inputs = {k: v.to(self.model.device) if hasattr(v, 'to') else v 
                                for k, v in model_inputs.items()}
             
-            # Get model outputs
-            outputs = self.model(**model_inputs, **forward_kwargs)
+            # Get model outputs - don't pass attention_mask twice
+            # For Mamba models, ensure we don't pass it at all
+            if is_mamba and 'attention_mask' in model_inputs:
+                # Create a copy without attention_mask
+                mamba_inputs = {k: v for k, v in model_inputs.items() if k != 'attention_mask'}
+                outputs = self.model(**mamba_inputs, **forward_kwargs)
+            else:
+                outputs = self.model(**model_inputs, **forward_kwargs)
                 
         hidden_states = self._get_hidden_states(outputs, rep_token, hidden_layers, which_hidden_states)
         
         # Add ensemble processing for Mamba models
-        is_mamba = False
-        if hasattr(self.model, 'config'):
-            model_type = getattr(self.model.config, 'model_type', '')
-            is_mamba = model_type == 'mamba' or 'mamba' in model_type.lower()
-        
         if is_mamba or hasattr(outputs, 'ssm_states'):
             hidden_states = self._ensemble_process_hidden_states(hidden_states, hidden_layers)
         
