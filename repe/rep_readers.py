@@ -409,14 +409,20 @@ class ClusterMeanRepReader(RepReader):
             # Print debug info about shapes
             logger.info(f"Layer {layer} - H_train shape: {H_train.shape}, direction shape: {direction.shape}, labels length: {len(train_labels)}")
             
-            # Skip if shapes are incompatible and set default sign
+            # For Mamba, we often get directions with shape (1,) that need to be expanded
+            # properly to (1, hidden_size)
             if len(direction.shape) <= 1 and direction.shape[0] == 1:
-                logger.warning(f"Direction for layer {layer} has invalid shape {direction.shape}. Using default sign.")
-                signs[layer] = np.array([1])
-                continue
+                # Get the expected feature dimension from H_train
+                feature_dim = H_train.shape[1]
+                logger.warning(f"Direction has wrong shape ({direction.shape}), reshaping to (1, {feature_dim})")
+                # Create a proper direction vector with correct shape
+                # For a single scalar value, we'll create a vector with that value
+                # repeated across the feature dimension
+                value = direction[0] if direction.size > 0 else 1.0
+                direction = np.full((1, feature_dim), value)
             
-            # For 1D vectors, reshape to 2D
-            if len(direction.shape) == 1:
+            # For other 1D vectors, reshape to 2D
+            elif len(direction.shape) == 1:
                 direction = direction.reshape(1, -1)
             
             # Check if last dimension matches
@@ -439,20 +445,32 @@ class ClusterMeanRepReader(RepReader):
                 # Handle size mismatch between hidden states and labels
                 if len(train_labels_np) != len(H_train):
                     logger.warning(f"Size mismatch: labels ({len(train_labels_np)}) vs hidden states ({len(H_train)}). Using first {min(len(train_labels_np), len(H_train))} examples.")
-                    
-                    # Use as many labels as possible without error
-                    size = min(len(train_labels_np), len(H_train))
-                    truncated_labels = train_labels_np[:size]
-                    truncated_projections = projections[:size]
-                    
-                    # Calculate positive and negative indices on the truncated data
-                    pos_indices = truncated_labels == 1
-                    neg_indices = truncated_labels == 0
+                    min_size = min(len(train_labels_np), len(H_train))
+                    H_train = H_train[:min_size]
+                    train_labels_np = train_labels_np[:min_size]
+                    projections = projections[:min_size]
+                
+                # Calculate binary labels
+                pos_indices = train_labels_np > 0
+                neg_indices = train_labels_np <= 0
+                
+                # Ensure projections have the right shape for indexing
+                # Shape debugging
+                logger.info(f"Layer {layer} - projections shape before processing: {projections.shape}")
+                
+                # Always squeeze to flatten any single dimensions
+                if len(projections.shape) > 1:
+                    if projections.shape[1] > 1:
+                        # If we have multiple dimensions, take the mean
+                        truncated_projections = np.mean(projections, axis=1)
+                    else:
+                        # If we have just one dimension but in 2D format (n,1), flatten it
+                        truncated_projections = projections.squeeze()
                 else:
-                    # Normal case where sizes match
-                    pos_indices = train_labels_np == 1
-                    neg_indices = train_labels_np == 0
+                    # Already a 1D array
                     truncated_projections = projections
+                    
+                logger.info(f"Layer {layer} - truncated_projections shape: {truncated_projections.shape}, pos_indices shape: {pos_indices.shape}")
                 
                 if np.any(pos_indices) and np.any(neg_indices):
                     # Use the truncated projections for mean calculation
