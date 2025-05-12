@@ -125,27 +125,41 @@ class RepReader(ABC):
 
     def transform(self, hidden_states, hidden_layers, component_index):
         """Project the hidden states onto the concept directions in self.directions
-
+        
         Args:
             hidden_states: dictionary with entries of dimension (n_examples, hidden_size)
             hidden_layers: list of layers to consider
             component_index: index of the component to use from self.directions
-
+        
         Returns:
             transformed_hidden_states: dictionary with entries of dimension (n_examples,)
         """
-
-        assert component_index < self.n_components
         transformed_hidden_states = {}
         for layer in hidden_layers:
-            layer_hidden_states = hidden_states[layer]
-
-            if hasattr(self, 'H_train_means'):
-                layer_hidden_states = recenter(layer_hidden_states, mean=self.H_train_means[layer])
-
-            # project hidden states onto found concept directions (e.g. onto PCA comp 0) 
-            H_transformed = project_onto_direction(layer_hidden_states, self.directions[layer][component_index])
-            transformed_hidden_states[layer] = H_transformed.cpu().numpy()       
+            if layer in hidden_states and layer in self.directions:
+                direction = self.directions[layer][component_index]
+                
+                # Apply additional normalization for robustness, especially for Mamba
+                if isinstance(hidden_states[layer], torch.Tensor):
+                    H = hidden_states[layer]
+                    # Normalize H for more stable projections
+                    H_norm = torch.norm(H, dim=1, keepdim=True)
+                    H = H / (H_norm + 1e-8)
+                else:
+                    H = hidden_states[layer]
+                    # Normalize H for more stable projections
+                    H_norm = np.linalg.norm(H, axis=1, keepdims=True)
+                    H = H / (H_norm + 1e-8)
+                
+                # Project onto direction
+                projected = project_onto_direction(H=H, direction=direction)
+                
+                if self.direction_signs is not None and layer in self.direction_signs:
+                    sign = self.direction_signs[layer][component_index]
+                    transformed_hidden_states[layer] = projected * sign
+                else:
+                    transformed_hidden_states[layer] = projected
+        
         return transformed_hidden_states
 
 class PCARepReader(RepReader):
@@ -237,6 +251,7 @@ class PCARepReader(RepReader):
 class ClusterMeanRepReader(RepReader):
     """Get the direction that is the difference between the mean of the positive and negative clusters
     in model hidden states."""
+
     n_components = 1
     needs_hiddens = True
 
@@ -286,14 +301,58 @@ class ClusterMeanRepReader(RepReader):
             else:
                 H_train = np.array(hidden_states[layer])
 
+            # Apply robust normalization
+            H_train = H_train / (np.linalg.norm(H_train, axis=1, keepdims=True) + 1e-8)
+
             # Calculate mean vectors for positive and negative classes
             H_pos_mean = H_train[pos_class].mean(axis=0, keepdims=True)
             H_neg_mean = H_train[neg_class].mean(axis=0, keepdims=True)
 
             # The direction is from negative to positive class
-            directions[layer] = H_pos_mean - H_neg_mean
+            direction = H_pos_mean - H_neg_mean
+            
+            # Normalize the direction vector
+            direction = direction / (np.linalg.norm(direction) + 1e-8)
+            
+            directions[layer] = direction
         
         return directions
+        
+    def get_signs(self, hidden_states, train_labels, hidden_layers):
+        """Determine whether the negative or positive direction corresponds to "honesty"
+        Return sign array (n_components=1) for each layer.
+        """
+        signs = {}
+        
+        for layer in hidden_layers:
+            if layer not in hidden_states:
+                continue
+                
+            if isinstance(hidden_states[layer], torch.Tensor):
+                H_train = hidden_states[layer].cpu().numpy()
+            else:
+                H_train = np.array(hidden_states[layer])
+                
+            # Normalize for stability
+            H_train = H_train / (np.linalg.norm(H_train, axis=1, keepdims=True) + 1e-8)
+            
+            # Project onto direction
+            direction = self.directions[layer]
+            projections = H_train @ direction.T
+            
+            # Get labels for each entry
+            train_labels_np = np.array(train_labels)
+            
+            # Calculate mean projections for positive and negative classes
+            pos_mean = projections[train_labels_np == 1].mean()
+            neg_mean = projections[train_labels_np == 0].mean()
+            
+            # Determine sign: if positive directions correlate with positive labels,
+            # sign should be positive; otherwise negative
+            sign = 1 if pos_mean > neg_mean else -1
+            signs[layer] = np.array([sign])
+            
+        return signs
 
 
 class RandomRepReader(RepReader):
@@ -329,8 +388,56 @@ class RandomRepReader(RepReader):
         return directions
 
 
+class MambaRepReader(ClusterMeanRepReader):
+    """
+    Specialized RepReader for Mamba models that applies additional processing
+    to account for state space model characteristics.
+    """
+    
+    def __init__(self, n_ensembles=5):
+        super().__init__()
+        self.n_ensembles = n_ensembles
+    
+    def get_rep_directions(self, model, tokenizer, hidden_states, hidden_layers, **kwargs):
+        # Get base directions using ClusterMean approach
+        base_directions = super().get_rep_directions(model, tokenizer, hidden_states, hidden_layers, **kwargs)
+        
+        # Apply additional ensemble processing for Mamba
+        ensemble_directions = {}
+        for layer in hidden_layers:
+            if layer not in base_directions:
+                continue
+                
+            # Create ensemble of directions with small random perturbations
+            direction_ensembles = []
+            base_dir = base_directions[layer]
+            
+            # Original direction
+            direction_ensembles.append(base_dir)
+            
+            # Add perturbed versions
+            for _ in range(self.n_ensembles - 1):
+                # Add small random noise (1% of magnitude)
+                noise_scale = 0.01 * np.linalg.norm(base_dir)
+                noise = np.random.randn(*base_dir.shape) * noise_scale
+                perturbed_dir = base_dir + noise
+                # Renormalize
+                perturbed_dir = perturbed_dir / np.linalg.norm(perturbed_dir)
+                direction_ensembles.append(perturbed_dir)
+            
+            # Average the ensemble
+            ensemble_directions[layer] = np.mean(direction_ensembles, axis=0)
+            
+            # Renormalize
+            norm = np.linalg.norm(ensemble_directions[layer])
+            if norm > 0:
+                ensemble_directions[layer] = ensemble_directions[layer] / norm
+            
+        return ensemble_directions
+
 DIRECTION_FINDERS = {
     'pca': PCARepReader,
     'cluster_mean': ClusterMeanRepReader,
     'random': RandomRepReader,
+    'mamba': MambaRepReader,
 }

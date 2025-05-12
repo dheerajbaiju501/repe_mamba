@@ -41,16 +41,26 @@ class RepReadingPipeline(Pipeline):
         
         # Check for SSM states (Mamba models)
         if hasattr(outputs, 'ssm_states') and outputs.ssm_states is not None:
-            # Using SSM states directly
+            # Mamba-specific handling with improved stability
             for layer in hidden_layers:
                 layer_idx = layer if layer >= 0 else len(outputs.ssm_states) + layer
                 if 0 <= layer_idx < len(outputs.ssm_states):
                     hidden_states = outputs.ssm_states[layer_idx]
                     # For rep_token=-1, get the last token's state
                     token_idx = rep_token if rep_token >= 0 else hidden_states.size(1) + rep_token
+                    
+                    # Apply additional stabilization for Mamba
                     hidden_states = hidden_states[:, token_idx, :].detach()
+                    
+                    # Convert to float32 for stability
                     if hidden_states.dtype == torch.bfloat16:
                         hidden_states = hidden_states.float()
+                    
+                    # Apply layer normalization for Mamba states
+                    # This is critical for stable representations
+                    norm = torch.norm(hidden_states, dim=1, keepdim=True)
+                    hidden_states = hidden_states / (norm + 1e-8)
+                    
                     hidden_states_layers[layer] = hidden_states.detach()
             return hidden_states_layers
             
@@ -126,18 +136,71 @@ class RepReadingPipeline(Pipeline):
     def postprocess(self, outputs):
         return outputs
 
+    def _ensemble_process_hidden_states(self, hidden_states, hidden_layers, n_samples=3):
+        """
+        Process hidden states with ensemble averaging for more stable representations
+        
+        Args:
+            hidden_states: Dictionary of hidden states by layer
+            hidden_layers: List of layers to process
+            n_samples: Number of samples for ensemble averaging
+            
+        Returns:
+            Processed hidden states with ensemble averaging
+        """
+        processed_states = {}
+        
+        for layer in hidden_layers:
+            if layer not in hidden_states:
+                continue
+                
+            layer_states = hidden_states[layer]
+            
+            # For tensor processing
+            if isinstance(layer_states, torch.Tensor):
+                # Apply random dropout for ensemble effect
+                ensemble_states = []
+                for _ in range(n_samples):
+                    # Apply dropout at 10%
+                    mask = torch.bernoulli(torch.ones_like(layer_states) * 0.9)
+                    dropped_states = layer_states * mask / 0.9  # Scale to maintain magnitude
+                    ensemble_states.append(dropped_states)
+                    
+                # Average the ensemble
+                processed_states[layer] = torch.stack(ensemble_states).mean(dim=0)
+            
+            # For numpy processing
+            else:
+                ensemble_states = []
+                for _ in range(n_samples):
+                    # Apply dropout at 10%
+                    mask = np.random.binomial(1, 0.9, layer_states.shape)
+                    dropped_states = layer_states * mask / 0.9  # Scale to maintain magnitude
+                    ensemble_states.append(dropped_states)
+                    
+                # Average the ensemble
+                processed_states[layer] = np.mean(ensemble_states, axis=0)
+        
+        return processed_states
+
     def _forward(self, model_inputs, rep_token, hidden_layers, rep_reader=None, component_index=0, which_hidden_states=None, pad_token_id=None):
         """Forward pass for model"""
         # Run the model and get hidden states
         with torch.no_grad():
-            # Ensure the proper config for model
-            forward_kwargs = {
-                'output_hidden_states': True,
-                'return_dict': True
-            }
+            # Use attention mask if available
+            forward_kwargs = {}
+            if 'attention_mask' in model_inputs:
+                forward_kwargs['attention_mask'] = model_inputs['attention_mask']
             
-            # Move inputs to the same device as the model
-            if hasattr(self.model, 'device') and hasattr(model_inputs, 'to'):
+            if pad_token_id is not None:
+                forward_kwargs['pad_token_id'] = pad_token_id
+            
+            # Set output_hidden_states=True and return_dict=True by default
+            forward_kwargs['output_hidden_states'] = True
+            forward_kwargs['return_dict'] = True
+            
+            # Move all tensors to device
+            if hasattr(self.model, 'device'):
                 model_inputs = {k: v.to(self.model.device) if hasattr(v, 'to') else v 
                                for k, v in model_inputs.items()}
             
@@ -146,11 +209,19 @@ class RepReadingPipeline(Pipeline):
                 
         hidden_states = self._get_hidden_states(outputs, rep_token, hidden_layers, which_hidden_states)
         
+        # Add ensemble processing for Mamba models
+        is_mamba = False
+        if hasattr(self.model, 'config'):
+            model_type = getattr(self.model.config, 'model_type', '')
+            is_mamba = model_type == 'mamba' or 'mamba' in model_type.lower()
+        
+        if is_mamba or hasattr(outputs, 'ssm_states'):
+            hidden_states = self._ensemble_process_hidden_states(hidden_states, hidden_layers)
+        
         if rep_reader is None:
             return hidden_states
         
         return rep_reader.transform(hidden_states, hidden_layers, component_index)
-
 
     def _batched_string_to_hiddens(self, train_inputs, rep_token, hidden_layers, batch_size, which_hidden_states, **tokenizer_args):
         # Wrapper method to get a dictionary hidden states from a list of strings
