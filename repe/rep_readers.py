@@ -325,43 +325,66 @@ class ClusterMeanRepReader(RepReader):
         signs = {}
         
         for layer in hidden_layers:
-            if layer not in hidden_states:
+            if layer not in hidden_states or layer not in self.directions:
+                logger.warning(f"Layer {layer} missing in hidden_states or directions. Skipping sign determination.")
+                signs[layer] = np.array([1])  # Default to positive sign
                 continue
                 
+            # Get hidden states
             if isinstance(hidden_states[layer], torch.Tensor):
                 H_train = hidden_states[layer].cpu().numpy()
             else:
                 H_train = np.array(hidden_states[layer])
                 
+            # Get direction and ensure it has the right shape
+            direction = self.directions[layer]
+            
+            # Print debug info about shapes
+            logger.info(f"Layer {layer} - H_train shape: {H_train.shape}, direction shape: {direction.shape}")
+            
+            # Skip if shapes are incompatible and set default sign
+            if len(direction.shape) <= 1 and direction.shape[0] == 1:
+                logger.warning(f"Direction for layer {layer} has invalid shape {direction.shape}. Using default sign.")
+                signs[layer] = np.array([1])
+                continue
+            
+            # For 1D vectors, reshape to 2D
+            if len(direction.shape) == 1:
+                direction = direction.reshape(1, -1)
+            
+            # Check if last dimension matches
+            feature_dim = H_train.shape[1]
+            if direction.shape[1] != feature_dim:
+                logger.warning(f"Direction feature dim {direction.shape[1]} doesn't match hidden states dim {feature_dim}. Using default sign.")
+                signs[layer] = np.array([1])
+                continue
+            
             # Normalize for stability
             H_train = H_train / (np.linalg.norm(H_train, axis=1, keepdims=True) + 1e-8)
             
-            # Project onto direction
-            direction = self.directions[layer]
-            
-            # Fix dimension mismatch - ensure direction is properly shaped for matmul
-            if direction.shape[0] == 1:  # If direction is a row vector (1, d)
+            try:
+                # Project hidden states onto direction
                 projections = np.dot(H_train, direction.T)
-            else:  # If direction is a column vector or has other shape
-                # Reshape to ensure correct multiplication
-                direction_reshaped = direction.reshape(1, -1) if len(direction.shape) == 1 else direction
-                projections = np.dot(H_train, direction_reshaped.T)
-            
-            # Get labels for each entry
-            train_labels_np = np.array(train_labels)
-            
-            # Calculate mean projections for positive and negative classes
-            pos_indices = train_labels_np == 1
-            neg_indices = train_labels_np == 0
-            
-            if np.any(pos_indices) and np.any(neg_indices):
-                pos_mean = np.mean(projections[pos_indices])
-                neg_mean = np.mean(projections[neg_indices])
-                # Determine sign: if positive directions correlate with positive labels,
-                # sign should be positive; otherwise negative
-                sign = 1 if pos_mean > neg_mean else -1
-            else:
-                # Default to positive if no comparison can be made
+                
+                # Get labels for each entry
+                train_labels_np = np.array(train_labels)
+                
+                # Calculate mean projections for positive and negative classes
+                pos_indices = train_labels_np == 1
+                neg_indices = train_labels_np == 0
+                
+                if np.any(pos_indices) and np.any(neg_indices):
+                    pos_mean = np.mean(projections[pos_indices])
+                    neg_mean = np.mean(projections[neg_indices])
+                    # Determine sign: if positive directions correlate with positive labels,
+                    # sign should be positive; otherwise negative
+                    sign = 1 if pos_mean > neg_mean else -1
+                else:
+                    # Default to positive if no comparison can be made
+                    logger.warning(f"No positive or negative examples for layer {layer}. Using default sign.")
+                    sign = 1
+            except Exception as e:
+                logger.error(f"Error computing sign for layer {layer}: {str(e)}. Using default sign.")
                 sign = 1
                 
             signs[layer] = np.array([sign])
