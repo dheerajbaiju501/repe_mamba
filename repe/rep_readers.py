@@ -320,23 +320,21 @@ class ClusterMeanRepReader(RepReader):
             neg_class = np.where(train_choices_np == 0)
             pos_class = np.where(train_choices_np == 1)
             
-            # Handle case where one class has no examples
-            if len(neg_class[0]) == 0 or len(pos_class[0]) == 0:
-                logger.warning(f"One class has no examples in layer {layer}. Using random direction.")
-                # Get hidden dimension size
-                if isinstance(hidden_states[layer], torch.Tensor):
-                    H_train = hidden_states[layer].cpu().numpy()
-                else:
-                    H_train = np.array(hidden_states[layer])
-                hidden_size = H_train.shape[1]
-                directions[layer] = np.random.randn(1, hidden_size)
-                continue
-
-            # Convert to numpy if tensor
+            # Get hidden dimension size first
             if isinstance(hidden_states[layer], torch.Tensor):
                 H_train = hidden_states[layer].cpu().numpy()
             else:
                 H_train = np.array(hidden_states[layer])
+            
+            hidden_size = H_train.shape[1]
+            logger.info(f"Layer {layer} - Hidden size: {hidden_size}")
+            
+            # Handle case where one class has no examples
+            if len(neg_class[0]) == 0 or len(pos_class[0]) == 0:
+                logger.warning(f"One class has no examples in layer {layer}. Using random direction.")
+                # Create a properly shaped random direction vector
+                directions[layer] = np.random.randn(1, hidden_size)
+                continue
 
             # Apply robust normalization
             H_train = H_train / (np.linalg.norm(H_train, axis=1, keepdims=True) + 1e-8)
@@ -348,9 +346,27 @@ class ClusterMeanRepReader(RepReader):
             # The direction is from negative to positive class
             direction = H_pos_mean - H_neg_mean
             
-            # Normalize the direction vector
-            direction = direction / (np.linalg.norm(direction) + 1e-8)
+            # Check that the direction has the right shape
+            if direction.shape != (1, hidden_size):
+                logger.warning(f"Direction has wrong shape {direction.shape}, reshaping to (1, {hidden_size})")
+                if len(direction.shape) == 1:
+                    direction = direction.reshape(1, -1)
+                elif direction.shape[0] != 1:
+                    direction = direction.mean(axis=0, keepdims=True)
             
+            # Normalize the direction vector
+            norm = np.linalg.norm(direction)
+            if norm < 1e-8:
+                logger.warning(f"Direction vector for layer {layer} has near-zero norm. Using random direction.")
+                direction = np.random.randn(1, hidden_size)
+            else:
+                direction = direction / norm
+            
+            # Verify final shape is correct
+            if direction.shape != (1, hidden_size):
+                logger.error(f"Final direction still has wrong shape {direction.shape}. Fixing to (1, {hidden_size})")
+                direction = np.random.randn(1, hidden_size)  # Last resort fallback
+                
             directions[layer] = direction
         
         return directions
