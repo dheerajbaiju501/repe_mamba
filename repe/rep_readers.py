@@ -350,7 +350,21 @@ class ClusterMeanRepReader(RepReader):
             if direction.shape != (1, hidden_size):
                 logger.warning(f"Direction has wrong shape {direction.shape}, reshaping to (1, {hidden_size})")
                 if len(direction.shape) == 1:
-                    direction = direction.reshape(1, -1)
+                    # Create a properly shaped direction vector
+                    if direction.shape[0] == 1:
+                        # This is the problematic case - a scalar in a 1D array
+                        new_direction = np.zeros((1, hidden_size))
+                        new_direction[0, 0] = direction[0]  # Place the value in the first position
+                        direction = new_direction
+                    else:
+                        # This is a vector, reshape to row vector
+                        direction = direction.reshape(1, -1)
+                        # If it doesn't match hidden_size, pad or truncate
+                        if direction.shape[1] != hidden_size:
+                            new_direction = np.zeros((1, hidden_size))
+                            copy_size = min(direction.shape[1], hidden_size)
+                            new_direction[0, :copy_size] = direction[0, :copy_size]
+                            direction = new_direction
                 elif direction.shape[0] != 1:
                     direction = direction.mean(axis=0, keepdims=True)
             
@@ -393,7 +407,7 @@ class ClusterMeanRepReader(RepReader):
             direction = self.directions[layer]
             
             # Print debug info about shapes
-            logger.info(f"Layer {layer} - H_train shape: {H_train.shape}, direction shape: {direction.shape}")
+            logger.info(f"Layer {layer} - H_train shape: {H_train.shape}, direction shape: {direction.shape}, labels length: {len(train_labels)}")
             
             # Skip if shapes are incompatible and set default sign
             if len(direction.shape) <= 1 and direction.shape[0] == 1:
@@ -419,19 +433,35 @@ class ClusterMeanRepReader(RepReader):
                 # Project hidden states onto direction
                 projections = np.dot(H_train, direction.T)
                 
-                # Get labels for each entry
+                # Get labels for each entry - handle size mismatch
                 train_labels_np = np.array(train_labels)
                 
-                # Calculate mean projections for positive and negative classes
-                pos_indices = train_labels_np == 1
-                neg_indices = train_labels_np == 0
+                # Handle size mismatch between hidden states and labels
+                if len(train_labels_np) != len(H_train):
+                    logger.warning(f"Size mismatch: labels ({len(train_labels_np)}) vs hidden states ({len(H_train)}). Using first {min(len(train_labels_np), len(H_train))} examples.")
+                    
+                    # Use as many labels as possible without error
+                    size = min(len(train_labels_np), len(H_train))
+                    truncated_labels = train_labels_np[:size]
+                    truncated_projections = projections[:size]
+                    
+                    # Calculate positive and negative indices on the truncated data
+                    pos_indices = truncated_labels == 1
+                    neg_indices = truncated_labels == 0
+                else:
+                    # Normal case where sizes match
+                    pos_indices = train_labels_np == 1
+                    neg_indices = train_labels_np == 0
+                    truncated_projections = projections
                 
                 if np.any(pos_indices) and np.any(neg_indices):
-                    pos_mean = np.mean(projections[pos_indices])
-                    neg_mean = np.mean(projections[neg_indices])
+                    # Use the truncated projections for mean calculation
+                    pos_mean = np.mean(truncated_projections[pos_indices])
+                    neg_mean = np.mean(truncated_projections[neg_indices])
                     # Determine sign: if positive directions correlate with positive labels,
                     # sign should be positive; otherwise negative
                     sign = 1 if pos_mean > neg_mean else -1
+                    logger.info(f"Layer {layer} - pos_mean: {pos_mean:.4f}, neg_mean: {neg_mean:.4f}, sign: {sign}")
                 else:
                     # Default to positive if no comparison can be made
                     logger.warning(f"No positive or negative examples for layer {layer}. Using default sign.")
