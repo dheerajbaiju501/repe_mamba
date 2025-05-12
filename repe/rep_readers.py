@@ -10,8 +10,16 @@ logger = logging.getLogger(__name__)
 
 def project_onto_direction(H, direction):
     """Project matrix H (n, d_1) onto direction vector (d_2,)"""
-    # Calculate the magnitude of the direction vector for model hidden states
-    # Ensure H and direction are on the same device (CPU or GPU)
+    # Handle empty or invalid inputs
+    if direction is None or (hasattr(direction, 'size') and direction.size == 0) or \
+       (hasattr(direction, 'numel') and direction.numel() == 0):
+        logger.error("Received empty direction vector in project_onto_direction")
+        if isinstance(H, torch.Tensor):
+            return torch.zeros(H.shape[0], device=H.device)
+        else:
+            return np.zeros(len(H))
+    
+    # Ensure H and direction are proper tensors on the same device
     if not isinstance(H, torch.Tensor):
         H = torch.tensor(H, dtype=torch.float32)
         # Only move to CUDA if available
@@ -19,17 +27,46 @@ def project_onto_direction(H, direction):
             H = H.cuda()
     
     if not isinstance(direction, torch.Tensor):
-        direction = torch.tensor(direction, dtype=torch.float32)
-        direction = direction.to(H.device)
+        try:
+            direction = torch.tensor(direction, dtype=torch.float32)
+            direction = direction.to(H.device)
+        except Exception as e:
+            logger.error(f"Failed to convert direction to tensor: {e}")
+            return torch.zeros(H.shape[0], device=H.device)
     
+    # Ensure the direction has proper dimensions for matmul
+    if direction.dim() == 0:  # scalar
+        logger.warning("Direction is a scalar, creating proper vector")
+        direction = torch.ones(H.shape[1], device=H.device) * direction
+    elif direction.dim() == 1:  # vector
+        if direction.shape[0] != H.shape[1]:
+            logger.error(f"Direction vector dimension {direction.shape[0]} doesn't match hidden state dimension {H.shape[1]}")
+            return torch.zeros(H.shape[0], device=H.device)
+    elif direction.dim() == 2:  # matrix - ensure it's a single vector
+        if direction.shape[0] == 1:  # row vector
+            direction = direction.squeeze(0)
+        elif direction.shape[1] == 1:  # column vector
+            direction = direction.squeeze(1)
+        else:
+            logger.error(f"Direction has invalid shape {direction.shape}")
+            return torch.zeros(H.shape[0], device=H.device)
+    
+    # Calculate magnitude, with safety check
     mag = torch.norm(direction)
     if torch.isinf(mag).any() or mag < 1e-8:
         logger.warning("Direction vector has extremely small or infinite magnitude")
         mag = torch.clamp(mag, min=1e-8)  # Prevent division by zero
     
-    # Calculate the projection
-    projection = H.matmul(direction) / mag
-    return projection
+    # Debug info
+    logger.info(f"H shape: {H.shape}, direction shape: {direction.shape}")
+    
+    try:
+        # Calculate the projection safely
+        projection = H.matmul(direction) / mag
+        return projection
+    except Exception as e:
+        logger.error(f"Error in projection calculation: {e}")
+        return torch.zeros(H.shape[0], device=H.device)
 
 def recenter(x, mean=None):
     # Convert to tensor if not already
