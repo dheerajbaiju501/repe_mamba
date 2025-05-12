@@ -338,18 +338,32 @@ class ClusterMeanRepReader(RepReader):
             
             # Project onto direction
             direction = self.directions[layer]
-            projections = H_train @ direction.T
+            
+            # Fix dimension mismatch - ensure direction is properly shaped for matmul
+            if direction.shape[0] == 1:  # If direction is a row vector (1, d)
+                projections = np.dot(H_train, direction.T)
+            else:  # If direction is a column vector or has other shape
+                # Reshape to ensure correct multiplication
+                direction_reshaped = direction.reshape(1, -1) if len(direction.shape) == 1 else direction
+                projections = np.dot(H_train, direction_reshaped.T)
             
             # Get labels for each entry
             train_labels_np = np.array(train_labels)
             
             # Calculate mean projections for positive and negative classes
-            pos_mean = projections[train_labels_np == 1].mean()
-            neg_mean = projections[train_labels_np == 0].mean()
+            pos_indices = train_labels_np == 1
+            neg_indices = train_labels_np == 0
             
-            # Determine sign: if positive directions correlate with positive labels,
-            # sign should be positive; otherwise negative
-            sign = 1 if pos_mean > neg_mean else -1
+            if np.any(pos_indices) and np.any(neg_indices):
+                pos_mean = np.mean(projections[pos_indices])
+                neg_mean = np.mean(projections[neg_indices])
+                # Determine sign: if positive directions correlate with positive labels,
+                # sign should be positive; otherwise negative
+                sign = 1 if pos_mean > neg_mean else -1
+            else:
+                # Default to positive if no comparison can be made
+                sign = 1
+                
             signs[layer] = np.array([sign])
             
         return signs
